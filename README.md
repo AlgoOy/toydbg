@@ -1,1 +1,5 @@
-#toydbg
+# toydbg
+
+## Supported commands
+
+- continue
