@@ -1,8 +1,9 @@
 #include <iostream>
 #include <unistd.h>
 #include <sys/ptrace.h>
+#include <sys/personality.h>
 
-#include "toydbg.hpp"
+#include "debugger.hpp"
 
 using namespace toydbg;
 
@@ -18,6 +19,7 @@ int main(int argc, char* argv[]) {
 
     if (pid == 0) {
         // child process
+        personality(ADDR_NO_RANDOMIZE);
         ptrace(PT_TRACE_ME, 0, nullptr, nullptr);
         execl(prog, prog, nullptr);
     }
