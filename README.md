@@ -6,3 +6,7 @@
 - break
 - register
 - memory
+- step
+- next
+- finish
+- stepi

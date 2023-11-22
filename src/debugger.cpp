@@ -31,8 +31,26 @@ void debugger::handle_command(const std::string &line) {
         continue_execution();
     }
     else if (is_prefix(command, "break")) {
-        std::string addr {args[1], 2};
-        set_breakpoint_at_address(std::stol(addr, 0, 16));
+        if (args[1][0] == '0' && args[1][1] == 'x') {
+            std::string addr {args[1], 2};
+            set_breakpoint_at_address(std::stol(addr, 0, 16));
+        }
+        else if (args[1].find(':') != std::string::npos) {
+            auto file_and_line = split(args[1], ':');
+            set_breakpoint_at_source_line(file_and_line[0], std::stoi(file_and_line[1]));
+        }
+        else {
+            set_breakpoint_at_function(args[1]);
+        }
+    }
+    else if (is_prefix(command, "step")) {
+        step_in();
+    }
+    else if (is_prefix(command, "next")) {
+        step_over();
+    }
+    else if (is_prefix(command, "finish")) {
+        step_out();
     }
     else if (is_prefix(command, "register")) {
         if (is_prefix(args[1], "dump")) {
@@ -55,6 +73,17 @@ void debugger::handle_command(const std::string &line) {
             std::string val {args[3], 2};
             write_memory(std::stol(addr, 0, 16), std::stol(val, 0, 16));
         }
+    }
+    else if (is_prefix(command, "symbol")) {
+        auto syms = lookup_symbol(args[1]);
+        for (auto &&s : syms) {
+            std::cout << s.name << " 0x" << std::hex << offset_dwarf_address(s.addr) << std::endl;
+        }
+    }
+    else if (is_prefix(command, "stepi")) {
+        single_step_instruction_with_breakpoint_check();
+        auto line_entry = get_line_entry_from_pc(get_offset_pc());
+        print_source(line_entry->file->path, line_entry->line);
     }
     else {
         std::cerr << "Unknown command\n";
@@ -220,8 +249,7 @@ void debugger::handle_sigtrap(siginfo_t info) {
     case TRAP_BRKPT: {
         set_pc(get_pc() - 1);
         std::cout << "Hit breakpoint at address 0x" << std::hex << get_pc() << std::endl;
-        auto offset_pc = offset_load_address(get_pc());
-        auto line_entry = get_line_entry_from_pc(offset_pc);
+        auto line_entry = get_line_entry_from_pc(get_offset_pc());
         print_source(line_entry->file->path, line_entry->line);
         return;
     }
@@ -231,4 +259,139 @@ void debugger::handle_sigtrap(siginfo_t info) {
         std::cout << "Unknown SIGTRAP code " << info.si_code << std::endl;
         return;
     }
+}
+
+void debugger::single_step_instruction() {
+    ptrace(PT_STEP, m_pid, nullptr, nullptr);
+    wait_for_signal();
+}
+
+void debugger::single_step_instruction_with_breakpoint_check() {
+    if (m_breakpoints.count(get_pc())) {
+        step_over_breakpoint();
+    }
+    else {
+        single_step_instruction();
+    }
+}
+
+void debugger::step_in() {
+    auto line = get_line_entry_from_pc(get_offset_pc())->line;
+
+    while (get_line_entry_from_pc(get_offset_pc())->line == line) {
+        single_step_instruction_with_breakpoint_check();
+    }
+
+    auto line_entry = get_line_entry_from_pc(get_offset_pc());
+    print_source(line_entry->file->path, line_entry->line);
+}
+
+void debugger::step_over() {
+    auto func = get_function_from_pc(get_offset_pc());
+    auto func_entry = at_low_pc(func);
+    auto func_end = at_high_pc(func);
+
+    auto line_entry = get_line_entry_from_pc(func_entry);
+    auto start_line = get_line_entry_from_pc(get_offset_pc());
+
+    std::vector<std::intptr_t> to_delete{};
+
+    while (line_entry->address < func_end) {
+        auto load_address = offset_dwarf_address(line_entry->address);
+        if (line_entry->address != start_line->address && !m_breakpoints.count(load_address)) {
+            set_breakpoint_at_address(load_address);
+            to_delete.push_back(load_address);
+        }
+        ++line_entry;
+    }
+
+    auto frame_pointer = get_register_value(m_pid, reg::rbp);
+    auto return_address = read_memory(frame_pointer + 8);
+    if (!m_breakpoints.count(return_address)) {
+        set_breakpoint_at_address(return_address);
+        to_delete.push_back(return_address);
+    }
+
+    continue_execution();
+    for (auto addr : to_delete) {
+        remove_breakpoint(addr);
+    }
+}
+
+void debugger::step_out() {
+    auto frame_pointer = get_register_value(m_pid, reg::rbp);
+    auto return_address = read_memory(frame_pointer + 8);
+
+    bool should_remove_breakpoint = false;
+    if (!m_breakpoints.count(return_address)) {
+        set_breakpoint_at_address(return_address);
+        should_remove_breakpoint = true;
+    }
+
+    continue_execution();
+
+    if (should_remove_breakpoint) {
+        remove_breakpoint(return_address);
+    }
+}
+
+void debugger::remove_breakpoint(std::intptr_t addr) {
+    if (m_breakpoints.at(addr).is_enabled()) {
+        m_breakpoints.at(addr).disable();
+    }
+    m_breakpoints.erase(addr);
+}
+
+uint64_t debugger::get_offset_pc() {
+    return offset_load_address(get_pc());
+}
+
+uint64_t debugger::offset_dwarf_address(uint64_t addr) {
+    return addr + m_load_address;
+}
+
+void debugger::set_breakpoint_at_function(const std::string &name) {
+    for (const auto &cu : m_dwarf.compilation_units()) {
+        for (const auto &die : cu.root()) {
+            if (die.has(dwarf::DW_AT::name) && at_name(die) == name) {
+                auto low_pc = at_low_pc(die);
+                auto entry = get_line_entry_from_pc(low_pc);
+                ++entry; //skip prologue
+                set_breakpoint_at_address(offset_dwarf_address(entry->address));
+            }
+        }
+    }
+}
+
+void debugger::set_breakpoint_at_source_line(const std::string &file, unsigned int line) {
+    for (const auto &cu : m_dwarf.compilation_units()) {
+        if (is_suffix(file, at_name(cu.root()))) {
+            const auto &lt = cu.get_line_table();
+            for (const auto &entry : lt) {
+                if (entry.is_stmt && entry.line == line) {
+                    set_breakpoint_at_address(offset_dwarf_address(entry.address));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+std::vector<symbol> debugger::lookup_symbol(const std::string &name) {
+    std::vector<symbol> syms;
+
+    for (auto &sec : m_elf.sections()) {
+        if (sec.get_hdr().type != elf::sht::symtab && sec.get_hdr().type != elf::sht::dynsym) {
+            continue;
+        }
+
+        for (auto sym : sec.as_symtab()) {
+            if (sym.get_name() == name) {
+                auto &d = sym.get_data();
+                syms.push_back(symbol{to_symbol_type(d.type()), name, d.value});
+            }
+        }
+    }
+
+    return syms;
 }
