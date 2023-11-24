@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(ToyDBG)
 
-add_compile_options(-std=c++11)
+add_compile_options(-std=c++14)
 set(CMAKE_BUILD_TYPE Debug)
 
 include_directories(lib/libelfin lib/linenoise include)
@@ -15,6 +15,9 @@ set_target_properties(HelloWorld PROPERTIES COMPILE_FLAGS "-g -gdwarf-4 -O0")
 
 add_executable(Stack examples/stack_unwinding.cpp)
 set_target_properties(Stack PROPERTIES COMPILE_FLAGS "-g -gdwarf-4 -O0")
+
+add_executable(Var examples/variable.cpp)
+set_target_properties(Var PROPERTIES COMPILE_FLAGS "-g -gdwarf-2 -O0")
 
 add_custom_target(
    libelfin

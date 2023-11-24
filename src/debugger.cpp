@@ -1,5 +1,6 @@
 #include <sys/wait.h>
 #include <sys/ptrace.h>
+#include <sys/user.h>
 #include <iomanip>
 #include <fstream>
 
@@ -10,6 +11,65 @@
 #include "register.hpp"
 
 using namespace toydbg;
+
+class ptrace_expr_context : public dwarf::expr_context {
+    public:
+        ptrace_expr_context(pid_t pid, uint64_t load_address) : 
+            m_pid{pid}, m_load_address{load_address} {};
+
+        dwarf::taddr reg(unsigned regnum) override {
+            return get_register_value_from_dwarf_register(m_pid, regnum);
+        }
+
+        dwarf::taddr pc() override {
+            struct user_regs_struct regs;
+            ptrace(PT_GETREGS, m_pid, nullptr, &regs);
+            return regs.rip - m_load_address;
+        }
+
+        dwarf::taddr deref_size(dwarf::taddr address, unsigned int size) override {
+            return ptrace(PT_READ_D, m_pid, reinterpret_cast<void *>(address + m_load_address), nullptr);
+        }
+
+    private:
+        pid_t m_pid;
+        uint64_t m_load_address;
+};
+
+void debugger::read_variables() {
+    auto func = get_function_from_pc(get_offset_pc());
+
+    for (const auto &die : func) {
+        if (die.tag == dwarf::DW_TAG::variable) {
+            auto loc_val = die[dwarf::DW_AT::location];
+
+            if (loc_val.get_type() == dwarf::value::type::exprloc) {
+                ptrace_expr_context context{m_pid, m_load_address};
+                auto result = loc_val.as_exprloc().evaluate(&context);
+
+                switch (result.location_type) {
+                case dwarf::expr_result::type::address: {
+                        auto value = read_memory(result.value);
+                        std::cout << at_name(die) << " (0x" << std::hex << result.value << ") = " 
+                            << std::dec << value << std::endl;
+                        break;
+                    }
+                case dwarf::expr_result::type::reg: {
+                        auto value = get_register_value_from_dwarf_register(m_pid, result.value);
+                        std::cout << at_name(die) << " (reg " << result.value << ") = " 
+                            << std::dec << value << std::endl;
+                        break;
+                    }
+                default:
+                    throw std::runtime_error{"Unhandled variable location"};
+                }
+            }
+            else {
+                throw std::runtime_error{"Unhandled variable location"};
+            }
+        }
+    }
+}
 
 void debugger::run() {
     wait_for_signal();
@@ -80,10 +140,16 @@ void debugger::handle_command(const std::string &line) {
             std::cout << s.name << " 0x" << std::hex << offset_dwarf_address(s.addr) << std::endl;
         }
     }
+    else if (is_prefix(command, "backtrace")) {
+        print_backtrace();
+    }
     else if (is_prefix(command, "stepi")) {
         single_step_instruction_with_breakpoint_check();
         auto line_entry = get_line_entry_from_pc(get_offset_pc());
         print_source(line_entry->file->path, line_entry->line);
+    }
+    else if(is_prefix(command, "variables")) {
+        read_variables();
     }
     else {
         std::cerr << "Unknown command\n";
@@ -394,4 +460,31 @@ std::vector<symbol> debugger::lookup_symbol(const std::string &name) {
     }
 
     return syms;
+}
+
+void debugger::print_backtrace() {
+    /** 
+     * mutable lambda
+     * 当使用 Lambda 表达式捕获变量时，默认情况下，被捕获的变量是只读的
+     * Lambda 表达式中的 mutable 关键字允许在 lambda 函数体中修改被捕获的变量
+     * 同时不会影响到原始变量
+     */
+    auto output_frame = [this, frame_number = 0] (dwarf::die &func) mutable {
+        std::cout << "frame #" << frame_number++ << ": 0x" << std::hex 
+            << offset_dwarf_address(dwarf::at_low_pc(func))
+            << ' ' << dwarf::at_name(func) << std::endl;
+    };
+
+    auto current_func = get_function_from_pc(get_offset_pc());
+    output_frame(current_func);
+
+    auto frame_pointer = get_register_value(m_pid, reg::rbp);
+    auto return_address = read_memory(frame_pointer + 8);
+
+    while (dwarf::at_name(current_func) != "main") {
+        current_func = get_function_from_pc(offset_load_address(return_address));
+        output_frame(current_func);
+        frame_pointer = read_memory(frame_pointer);
+        return_address = read_memory(frame_pointer + 8);
+    }
 }

@@ -10,3 +10,6 @@
 - next
 - finish
 - stepi
+- symbol
+- backtrace
+- variables
